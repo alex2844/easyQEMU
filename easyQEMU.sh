@@ -3,13 +3,11 @@
 # https://github.com/stylesuxx/amdvbflash/raw/master/amdvbflash
 # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.189-1/virtio-win-0.1.189.iso
 
-# TODO: разобраться почему при перезагрузке гостя изображение не появляется
-
 __filename="$(readlink --canonicalize-existing "$0")";
 __dirname="$(dirname "$__filename")";
 RUN=$(echo $0 | sed 's/\/usr\/local\/bin\///g' | sed 's/\/dev\/fd\/.*//g');
 ARGS=($@);
-SUDO="sudo";
+SUDO="sudo"; # TODO: проверить существование переменной, если нет и запущено через терминал, то sudo, иначе окно ввода пароля
 cd $__dirname;
 
 case ${ARGS[0]} in
@@ -36,8 +34,10 @@ case ${ARGS[0]} in
 			" | PCI (array) | устройства которые нужно перебросить (NULL)"
 			"options"
 			" | help | показать помощь"
-			# " | install | установить со всеми зависимостями"
+			" | install | установить со всеми зависимостями"
 			# " | gui | запуск в графическом режиме"
+			# " | autostart | Выполняется при запуске ОС" # В справке он не нужен
+			" | reload <wm> | Перезагрузиться в другую ОС (используя Ventoy)"
 			# " | mount <img> | смонтировать img файл для чтения, при прерывании размонтировать"
 			" | list | список виртуальных машин"
 			# " | create | создать виртуальную машину"
@@ -45,6 +45,7 @@ case ${ARGS[0]} in
 			" | status <wm> | статус виртуальной машины"
 			" | start <wm> | запустить виртуальную машину"
 			" | stop <wm> | остановить виртуальную машину"
+			" | ssh <wm> | подключиться к виртуальной машине"
 		);
 		printf "%s\n" "${table[@]}" | column -t -s '|';
 		exit;
@@ -63,21 +64,45 @@ case ${ARGS[0]} in
 			mkdir -p ./vm/ ./logs/ ./tools/; # Если на раздел с ventoy, то рут не нужен
 			$SUDO $RUN ${ARGS[@]};
 		else
+			if [ ! -z $(type -p pacman) ]; then
+                if [[ "$(( $(date +%s) - $(stat -c %Y /var/cache/pacman/pkg/) ))" -gt 12*60*60 ]]; then
+                    pacman -Syu;
+                fi
+                pacman -S at qemu edk2-ovmf jq;
+				systemctl enable --now atd;
+				if [ -z $(type -p samba) ] && [ ! -z "$SUDO_USER" ]; then
+                    pacman -S samba;
+				fi
+			fi
 			if [ ! -z $(type -p apt) ]; then
 				if [[ "$(( $(date +%s) - $(stat -c %Y /var/cache/apt/pkgcache.bin) ))" -gt 12*60*60 ]]; then
 					apt-get update;
 				fi
-				apt install at qemu-system kpartx -y;
-				if [ -r "/etc/kernelstub/configuration" ]; then # Pop_OS
-					apt install jq -y;
-				fi
+				apt install at qemu-system kpartx jq -y;
+				# if [ -r "/etc/kernelstub/configuration" ]; then # Pop_OS
+					# apt install jq -y;
+				# fi
 				if [ ! -z $(type -p nautilus) ] && [ -z $(type -p samba) ] && [ ! -z "$SUDO_USER" ]; then
 					apt install samba nautilus-share -y;
-					systemctl enable smb;
-					useradd -M $SUDO_USER;
-					smbpasswd -a $SUDO_USER;
 				fi
 			fi
+            if [ ! -z $(type -p samba) ] && [ ! -z "$SUDO_USER" ]; then
+				systemctl enable smb;
+				useradd -M $SUDO_USER;
+				smbpasswd -a $SUDO_USER;
+			fi
+			# TODO: если сервис не запущен, то запускать
+			# systemctl start atd
+			# systemctl enable atd
+			ln -s $__filename /usr/local/bin/easyQEMU; # TODO: если выполняется через curl|wget, то качаем
+			link=(
+				"[Desktop Entry]"
+				"Type=Application"
+				"Exec=easyQEMU autostart"
+				"X-GNOME-Autostart-enabled=true"
+				"Name=easyQEMU"
+			);
+			printf "%s\n" "${link[@]}" > /home/$SUDO_USER/.config/autostart/easyQEMU.desktop; # TODO: easyQEMU autostart в автозагрузку
 			usermod -aG kvm $SUDO_USER;
 			vendor=$(egrep '^(vendor_id|Hardware)' /proc/cpuinfo | cut -f2 -d: | sort -u | sed 's/.*\(Genuine\|Authentic\)//g; s/[[:space:]]\+//g;' | tr '[A-Z]' '[a-z]');
 			if [ "$vendor" != "intel" ] && [ "$vendor" != "amd" ]; then
@@ -96,8 +121,12 @@ case ${ARGS[0]} in
 			elif [ -r "/etc/default/grub" ]; then # Ubuntu
 				if [[ ! "$(cat /etc/default/grub)" =~ 'iommu' ]]; then
 					sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*/& ${vendor}_iommu=on iommu=pt/" /etc/default/grub;
-					sudo update-grub;
-				fi
+                    if [ ! -z $(type -p update-grub) ]; then
+                        update-grub;
+                    elif [ ! -z $(type -p grub-mkconfig) ]; then
+                        grub-mkconfig -o /boot/grub/grub.cfg;
+                    fi
+                fi
 			fi
 		fi
 		exit;
@@ -105,6 +134,104 @@ case ${ARGS[0]} in
 	gui )
 		echo "TODO: GUI";
 		exit;
+	;;
+	autostart )
+		# TODO:
+		# проверяем чтоб этот раздел был ventoy
+		# парсим ventoy.json
+		# проверяем есть ли файл ventoy.json.reload
+		# если да, то
+		# - удаляем ventoy.json и переименуем ventoy.json.reload в ventoy.json
+		# - если в спарсеном объекте autostart был не пуст, то выполняем
+		# если нету, то
+		# - проверяем в спарсеном объекте есть api, если да, то получаем содержимое в переменную
+		# - если содержимое не пустое, то переименуем ventoy.json в ventoy.json.reload
+		# - сохраняем содержимое в ventoy.json
+		# - перезагрузка
+		if [ -r "../ventoy/ventoy.json" ]; then
+			json=$(jq '.' '../ventoy/ventoy.json');
+			if [ -r "../ventoy/ventoy.json.reload" ]; then
+				rm ../ventoy/ventoy.json;
+				mv ../ventoy/ventoy.json.reload ../ventoy/ventoy.json;
+				autostart=$(echo $json | jq -r '.autostart');
+				if [ ! -z "$autostart" ] && [ "$autostart" != "null" ]; then
+					echo "DISPLAY=$DISPLAY $autostart" | at now;
+				fi
+			else
+				api=$(echo $json | jq -r '.api');
+				if [ ! -z "$api" ] && [ "$api" != "null" ]; then
+					get=$($(echo $([ `type -p curl` ] && echo "curl -s" || echo "wget -q -O -")" $api"));
+					if [ ! -z "$get" ]; then
+						mv ../ventoy/ventoy.json ../ventoy/ventoy.json.reload;
+						json=$(echo $get | jq '.');
+						(echo $json | jq '.') > ../ventoy/ventoy.json;
+						shutdown -r now;
+						# if [ ! -z $(type -p gnome-session-quit) ]; then
+							# gnome-session-quit --reboot --force --no-prompt;
+							# echo "DISPLAY=$DISPLAY gnome-session-quit --reboot --force --no-prompt" | at now;
+						# else
+							# $SUDO reboot;
+						# fi
+					fi
+				fi
+			fi
+		fi
+		exit;
+	;;
+	reload )
+		# TODO:
+		# проверяем чтоб этот раздел был ventoy
+		# ищем есть ли диск ОС в ventoy_grub.cfg
+		# если есть то переименуем ventoy.json в ventoy.json.reload
+		# control.VTOY_DEFAULT_IMAGE menuentry где расположен диск
+		# control.VTOY_MENU_TIMEOUT 1 чтоб в случае чего можно было загрузиться с другого места
+		# перезагрузка
+		if ([[ "$__dirname" =~ '/media/' ]] || [[ "$__dirname" =~ '/mnt/' ]]) && [[ "$__dirname" =~ '/Ventoy/' ]]; then
+			if [ -r "../ventoy/ventoy.json" ] && [ -r "../ventoy/ventoy_grub.cfg" ]; then
+				[ ! -z "${ARGS[1]}" ] && NAME="$(basename ${ARGS[1]%.*})";
+				[ ! -z "${ARGS[2]}" ] && autostart="${ARGS[2]}";
+				if [ -z "$NAME" ]; then
+					echo '[ERROR] Empty name vm';
+				else
+					list=$(awk -F\' '/menuentry / {print $2}' ../ventoy/ventoy_grub.cfg);
+					if [ ! -r "./vm/$NAME.sh" ] || [[ ! "$list" =~ "$NAME" ]]; then
+						echo "[ERROR] Not found vm: $NAME";
+					else
+						# cat ../ventoy/ventoy_grub.cfg | sed 's/\t//g' | sed ':a;N;$!ba;s/\n/ /g' | sed 's/  /\n/g'; # Зачем то усложняю
+						json=$(jq '.' '../ventoy/ventoy.json');
+						if [ ! -r "../ventoy/ventoy.json.reload" ]; then
+							mv ../ventoy/ventoy.json ../ventoy/ventoy.json.reload;
+						fi
+						theme=$(echo "$json" | jq -r '.theme');
+						json=(
+							--arg VTOY_DEFAULT_IMAGE "F6>$NAME"
+							--arg VTOY_MENU_TIMEOUT "1"
+							'.control |= .+ [{"VTOY_DEFAULT_IMAGE": $VTOY_DEFAULT_IMAGE},{"VTOY_MENU_TIMEOUT": $VTOY_MENU_TIMEOUT}]'
+						);
+						json=$(echo '{"control": []}' | jq "${json[@]}");
+						if [ ! -z "$autostart" ]; then
+							json=$(echo "$json" | jq --arg autostart "$autostart" '. + {"autostart": $autostart}');
+						fi
+						if [ ! -z "$theme" ] && [ "$theme" != "null" ]; then
+							json=$(echo "$json" | jq --argjson theme "$theme" '. + {"theme": $theme}');
+						fi
+						(echo $json | jq '.') > ../ventoy/ventoy.json;
+						shutdown -r now;
+						# if [ ! -z $(type -p gnome-session-quit) ]; then
+							# gnome-session-quit --reboot --force --no-prompt;
+						# else
+							# $SUDO reboot;
+						# fi
+					fi
+				fi
+			fi
+		else
+			echo '[ERROR] Ventoy not found';
+		fi
+		exit;
+	;;
+	resize )
+		echo 'qemu-img resize DISK.img +5G';
 	;;
 	mount )
 		if [ $(id -u) -ne 0 ]; then
@@ -285,6 +412,33 @@ case ${ARGS[0]} in
 		fi
 		exit;
 	;;
+	ssh )
+		[ ! -z "${ARGS[1]}" ] && NAME="$(basename ${ARGS[1]%.*})";
+		if [ -z "$NAME" ]; then
+			echo '[ERROR] Empty name vm';
+		else
+			if [ ! -r "./vm/$NAME.sh" ]; then
+				echo "[ERROR] Not found vm: $NAME";
+			else
+				source ./vm/$NAME.sh;
+				echo "[SSH] VM name: $NAME";
+				port=22;
+				if [ ! -z "$HOSTFWD" ]; then
+					for fwd in "${HOSTFWD[@]}"; do
+						if ([[ "$fwd" =~ '-:22' ]]); then
+							port=${fwd:5:-4};
+						fi
+					done
+				fi
+				if [ ! -z "$SSH_USER" ]; then
+					SSH_USER="$SSH_USER@";
+				fi
+				SSH_HOST='localhost';
+				ssh $SSH_USER$SSH_HOST -p $port;
+			fi
+		fi
+		exit;
+	;;
 esac
 
 if test -n "$STY"; then
@@ -317,6 +471,7 @@ echo "[DEBUG] ARCH: $(uname -m)";
 }
 [ -z "$CPUS" ] && CPUS=$(nproc);
 [ -z "$ARCH" ] && ARCH=$(uname -m); # (uname -m = x86_64) и (uname -p = x86_64) и (uname -i = x86_64)
+[ -z "$SMB" ] && SMB=$(xdg-user-dir PUBLICSHARE)
 if [ -z "$RAM" ]; then
 	RAM=$(awk '/MemFree/ { printf "%d", $2/1024 }' /proc/meminfo);
 	if [[ "$RAM" -lt '2048' ]]; then
@@ -389,9 +544,8 @@ if [ ! -z "$HOSTFWD" ]; then
 		hostfwds+=",hostfwd=$fwd";
 	done
 fi
-# TODO: добавить поддержку smb
 qemu+=(
-	-netdev user,id=hostnet0$hostfwds
+	-netdev user,id=hostnet0,smb=$SMB$hostfwds
 );
 if [ ! -z "$PCI" ]; then
 	qemu+=(
@@ -406,11 +560,14 @@ fi
 for disk_img in "${DISK[@]}"; do
 	if [ ${disk_img##*.} == "vhd" ]; then
 		disk_format='vpc';
+	elif [ ${disk_img##*.} == "vdi" ] || [ ${disk_img##*.} == "vtoy" ]; then
+		disk_format='vdi';
 	else
 		disk_format='raw';
 	fi
-	if [ ! -r "$disk_img" ] && [[ "$disk_img" =~ '/media/' ]]; then
-		$RUN mount "$disk_img" || exit 1;
+	disk_path="$(dirname "$disk_img")";
+	if [ ! -r "$disk_path" ] && [[ "$disk_path" =~ '/media/' ]]; then
+		$RUN mount "$disk_path" || exit 1;
 	fi
 	if [ ! -r "$disk_img" ]; then
 		if [[ "$disk_img" =~ '/dev/' ]]; then
@@ -443,7 +600,7 @@ if [ $CDROM_OFF -eq 0 ]; then
 		if [ ${DISK[0]##*.} == "vhd" ]; then
 			driver="./tools/virtio-win-0.1.215.iso";
 		else
-			driver="./tools/vtoyboot-1.0.20.iso";
+			driver="./tools/vtoyboot-1.0.24.iso";
 		fi
 		if [ -r "$driver" ]; then
 			qemu+=(-drive file=$driver,media=cdrom);
@@ -451,7 +608,11 @@ if [ $CDROM_OFF -eq 0 ]; then
 	fi
 fi
 if [ $UEFI -eq 1 ]; then
-	qemu+=(-bios /usr/share/ovmf/OVMF.fd);
+	if [ -r "/usr/share/ovmf/OVMF.fd" ]; then
+		qemu+=(-bios /usr/share/ovmf/OVMF.fd);
+	else
+		qemu+=(-bios /usr/share/ovmf/x64/OVMF.fd);
+	fi
 fi
 
 if [ ! -z "$PCI" ]; then
@@ -541,7 +702,7 @@ if [ ! -z "$PCI" ]; then
 		vendors[$i]=$vendor;
 		romfile='';
 		if [ "$driver" == "amdgpu" ]; then
-			romfile=",romfile=${video[3]}";
+			romfile=",multifunction=on,romfile=${video[3]}";
 		fi
 		qemu+=(-device pcie-root-port,port=0x1$ii,chassis=$iii,id=pci.$iii,bus=pcie.0,addr=0x2.0x$ii);
 		qemu+=(-device vfio-pci,host=$dev,id=hostdev$i,bus=pci.$iii,addr=0x0$romfile);
@@ -554,7 +715,9 @@ if [ ! -z "$PCI" ]; then
 	done
 fi
 
-qemu+=(${vga[@]});
+if [[ ! "${qemu[@]}" =~ '-display' ]]; then
+	qemu+=(${vga[@]});
+fi
 
 echo "[START] qemu";
 echo "qemu-system-$ARCH ${qemu[@]}";
